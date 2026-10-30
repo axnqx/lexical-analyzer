@@ -1125,3 +1125,28 @@ int main(int argc, char *argv[])
                ? EXIT_SUCCESS
                : EXIT_FAILURE;
 }
+
+
+
+
+
+
+
+
+
+On Terminal :
+
+Compile with
+clang -std=c11 -Wall -Wextra -pedantic lexer.c -o lexer
+
+Execute
+./lexer 
+
+the program will ask for
+Enter path of the C source file (.c):
+
+Enter 
+sample.c
+
+Alternatively, provide the filename directly:
+./lexer sample.c
