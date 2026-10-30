@@ -1,0 +1,1127 @@
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+/*
+ * Educational C lexical analyser (C11).
+ *
+ * It reports each token with its line, column and character count, then
+ * compares the number of stored tokens with the sum of all token categories.
+ * Whitespace and comments are deliberately skipped as C tokens.
+ */
+
+typedef enum {
+    TOK_KEYWORD = 0,
+    TOK_IDENTIFIER,
+    TOK_INTEGER_LITERAL,
+    TOK_FLOAT_LITERAL,
+    TOK_STRING_LITERAL,
+    TOK_CHARACTER_LITERAL,
+    TOK_OPERATOR,
+    TOK_PUNCTUATOR,
+    TOK_PREPROCESSOR,
+    TOK_INVALID,
+    TOK_TYPE_COUNT
+} TokenType;
+
+typedef struct {
+    char *lexeme;
+    size_t length;
+    size_t start_offset;
+    size_t end_offset;
+    size_t line;
+    size_t column;
+    TokenType type;
+    bool counted;
+} Token;
+
+typedef struct {
+    const char *source;
+    size_t source_length;
+    size_t position;
+    size_t line;
+    size_t column;
+
+    Token *tokens;
+    size_t token_count;
+    size_t token_capacity;
+    size_t category_count[TOK_TYPE_COUNT];
+
+    size_t total_comments;
+    size_t line_comments;
+    size_t block_comments;
+    size_t unterminated_comments;
+    size_t lexical_errors;
+    bool allocation_failed;
+} Lexer;
+
+typedef struct {
+    size_t total;
+    size_t letters;
+    size_t digits;
+    size_t whitespace;
+    size_t other;
+} CharacterSummary;
+
+typedef struct {
+    size_t line;
+    size_t column;
+} IdentifierOccurrence;
+
+typedef struct {
+    const char *name; /* Points to the first matching token's owned lexeme. */
+    size_t frequency;
+    IdentifierOccurrence *occurrences;
+    size_t occurrence_count;
+    size_t occurrence_capacity;
+} IdentifierEntry;
+
+typedef struct {
+    IdentifierEntry *entries;
+    size_t count;
+    size_t capacity;
+} IdentifierTable;
+
+static const char *token_type_name(TokenType type)
+{
+    static const char *names[TOK_TYPE_COUNT] = {
+        "Keyword",
+        "Identifier",
+        "Integer literal",
+        "Floating literal",
+        "String literal",
+        "Character literal",
+        "Operator",
+        "Punctuator",
+        "Preprocessor operator",
+        "Invalid / unknown"
+    };
+
+    if (type < 0 || type >= TOK_TYPE_COUNT) {
+        return "Invalid / unknown";
+    }
+    return names[type];
+}
+
+static char current_char(const Lexer *lexer)
+{
+    if (lexer->position >= lexer->source_length) {
+        return '\0';
+    }
+    return lexer->source[lexer->position];
+}
+
+static char lookahead_char(const Lexer *lexer, size_t distance)
+{
+    size_t index = lexer->position + distance;
+    if (index >= lexer->source_length) {
+        return '\0';
+    }
+    return lexer->source[index];
+}
+
+static void advance_char(Lexer *lexer)
+{
+    if (lexer->position >= lexer->source_length) {
+        return;
+    }
+
+    if (lexer->source[lexer->position] == '\n') {
+        lexer->line++;
+        lexer->column = 1;
+    } else {
+        lexer->column++;
+    }
+    lexer->position++;
+}
+
+static bool is_identifier_start(char c)
+{
+    unsigned char uc = (unsigned char)c;
+    return isalpha(uc) || c == '_';
+}
+
+static bool is_identifier_part(char c)
+{
+    unsigned char uc = (unsigned char)c;
+    return isalnum(uc) || c == '_';
+}
+
+static bool is_keyword(const char *word)
+{
+    /* C11 keywords. */
+    static const char *keywords[] = {
+        "auto", "break", "case", "char", "const", "continue",
+        "default", "do", "double", "else", "enum", "extern",
+        "float", "for", "goto", "if", "inline", "int", "long",
+        "register", "restrict", "return", "short", "signed", "sizeof",
+        "static", "struct", "switch", "typedef", "union", "unsigned",
+        "void", "volatile", "while", "_Alignas", "_Alignof", "_Atomic",
+        "_Bool", "_Complex", "_Generic", "_Imaginary", "_Noreturn",
+        "_Static_assert", "_Thread_local"
+    };
+
+    size_t count = sizeof(keywords) / sizeof(keywords[0]);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(word, keywords[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool add_token(Lexer *lexer, size_t start, size_t end,
+                      size_t line, size_t column, TokenType type)
+{
+    if (end <= start || end > lexer->source_length) {
+        return false;
+    }
+
+    if (lexer->token_count == lexer->token_capacity) {
+        size_t new_capacity = lexer->token_capacity == 0 ? 32 : lexer->token_capacity * 2;
+        if (new_capacity < lexer->token_capacity ||
+            new_capacity > SIZE_MAX / sizeof(Token)) {
+            lexer->allocation_failed = true;
+            return false;
+        }
+
+        Token *new_tokens = realloc(lexer->tokens, new_capacity * sizeof(Token));
+        if (new_tokens == NULL) {
+            lexer->allocation_failed = true;
+            return false;
+        }
+        lexer->tokens = new_tokens;
+        lexer->token_capacity = new_capacity;
+    }
+
+    size_t length = end - start;
+    char *copy = malloc(length + 1);
+    if (copy == NULL) {
+        lexer->allocation_failed = true;
+        return false;
+    }
+
+    memcpy(copy, lexer->source + start, length);
+    copy[length] = '\0';
+
+    Token *token = &lexer->tokens[lexer->token_count];
+    token->lexeme = copy;
+    token->length = length;
+    token->start_offset = start;
+    token->end_offset = end;
+    token->line = line;
+    token->column = column;
+    token->type = type;
+    token->counted = true;
+
+    lexer->token_count++;
+    lexer->category_count[type]++;
+
+    if (type == TOK_INVALID) {
+        lexer->lexical_errors++;
+    }
+    return true;
+}
+
+static bool is_hex_digit(char c)
+{
+    unsigned char uc = (unsigned char)c;
+    return isdigit(uc) || (uc >= 'a' && uc <= 'f') || (uc >= 'A' && uc <= 'F');
+}
+
+static bool consume_integer_suffix(const char *text, size_t *position)
+{
+    size_t p = *position;
+
+    if (text[p] == 'u' || text[p] == 'U') {
+        p++;
+        if (text[p] == 'l' || text[p] == 'L') {
+            char first_l = text[p++];
+            if (text[p] == first_l) {
+                p++;
+            }
+        }
+    } else if (text[p] == 'l' || text[p] == 'L') {
+        char first_l = text[p++];
+        if (text[p] == first_l) {
+            p++;
+        }
+        if (text[p] == 'u' || text[p] == 'U') {
+            p++;
+        }
+    }
+
+    *position = p;
+    return text[p] == '\0';
+}
+
+static bool is_valid_integer_literal(const char *text)
+{
+    size_t p = 0;
+    size_t digits = 0;
+    unsigned int base = 10;
+
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        p = 2;
+        while (is_hex_digit(text[p])) {
+            p++;
+            digits++;
+        }
+    } else if (text[0] == '0') {
+        base = 8;
+        p = 1;
+        digits = 1;
+        while (text[p] >= '0' && text[p] <= '7') {
+            p++;
+            digits++;
+        }
+        if (text[p] >= '8' && text[p] <= '9') {
+            return false;
+        }
+    } else {
+        while (text[p] >= '0' && text[p] <= '9') {
+            p++;
+            digits++;
+        }
+    }
+
+    (void)base; /* The base is reflected by the digit loop above. */
+    if (digits == 0) {
+        return false;
+    }
+    return consume_integer_suffix(text, &p);
+}
+
+static bool is_valid_floating_literal(const char *text)
+{
+    size_t p = 0;
+    size_t digits_before = 0;
+    size_t digits_after = 0;
+    bool has_dot = false;
+    bool has_exponent = false;
+
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        p = 2;
+        while (is_hex_digit(text[p])) {
+            p++;
+            digits_before++;
+        }
+        if (text[p] == '.') {
+            has_dot = true;
+            p++;
+            while (is_hex_digit(text[p])) {
+                p++;
+                digits_after++;
+            }
+        }
+        if (digits_before + digits_after == 0 ||
+            (text[p] != 'p' && text[p] != 'P')) {
+            return false;
+        }
+        has_exponent = true;
+        p++;
+        if (text[p] == '+' || text[p] == '-') {
+            p++;
+        }
+        size_t exponent_digits = 0;
+        while (isdigit((unsigned char)text[p])) {
+            p++;
+            exponent_digits++;
+        }
+        if (exponent_digits == 0) {
+            return false;
+        }
+    } else {
+        while (isdigit((unsigned char)text[p])) {
+            p++;
+            digits_before++;
+        }
+        if (text[p] == '.') {
+            has_dot = true;
+            p++;
+            while (isdigit((unsigned char)text[p])) {
+                p++;
+                digits_after++;
+            }
+        }
+        if (digits_before + digits_after == 0) {
+            return false;
+        }
+        if (text[p] == 'e' || text[p] == 'E') {
+            has_exponent = true;
+            p++;
+            if (text[p] == '+' || text[p] == '-') {
+                p++;
+            }
+            size_t exponent_digits = 0;
+            while (isdigit((unsigned char)text[p])) {
+                p++;
+                exponent_digits++;
+            }
+            if (exponent_digits == 0) {
+                return false;
+            }
+        }
+    }
+
+    if (!has_dot && !has_exponent) {
+        return false;
+    }
+
+    if (text[p] == 'f' || text[p] == 'F' || text[p] == 'l' || text[p] == 'L') {
+        p++;
+    }
+    return text[p] == '\0';
+}
+
+static bool has_string_or_character_prefix(const Lexer *lexer, size_t *prefix_length)
+{
+    char c = current_char(lexer);
+    char next = lookahead_char(lexer, 1);
+
+    if ((c == 'L' || c == 'u' || c == 'U') && (next == '"' || next == '\'')) {
+        *prefix_length = 1;
+        return true;
+    }
+    if (c == 'u' && next == '8' && lookahead_char(lexer, 2) == '"') {
+        *prefix_length = 2;
+        return true;
+    }
+    return false;
+}
+
+static bool scan_quoted_literal(Lexer *lexer, size_t prefix_length)
+{
+    size_t start = lexer->position;
+    size_t start_line = lexer->line;
+    size_t start_column = lexer->column;
+
+    for (size_t i = 0; i < prefix_length; i++) {
+        advance_char(lexer);
+    }
+
+    char quote = current_char(lexer);
+    bool is_string = quote == '"';
+    advance_char(lexer); /* Opening quote. */
+
+    bool closed = false;
+    while (lexer->position < lexer->source_length) {
+        char c = current_char(lexer);
+
+        if (c == quote) {
+            advance_char(lexer);
+            closed = true;
+            break;
+        }
+        if (c == '\n' || c == '\r') {
+            /* A physical newline is not allowed inside an unescaped literal. */
+            break;
+        }
+        if (c == '\\') {
+            advance_char(lexer);
+            if (lexer->position < lexer->source_length) {
+                advance_char(lexer); /* Escaped character (or line continuation). */
+            }
+        } else {
+            advance_char(lexer);
+        }
+    }
+
+    TokenType type;
+    if (!closed) {
+        type = TOK_INVALID;
+    } else if (is_string) {
+        type = TOK_STRING_LITERAL;
+    } else {
+        type = TOK_CHARACTER_LITERAL;
+    }
+
+    return add_token(lexer, start, lexer->position, start_line, start_column, type);
+}
+
+static void skip_line_comment(Lexer *lexer)
+{
+    lexer->total_comments++;
+    lexer->line_comments++;
+    advance_char(lexer); /* / */
+    advance_char(lexer); /* / */
+    while (lexer->position < lexer->source_length && current_char(lexer) != '\n') {
+        advance_char(lexer);
+    }
+}
+
+static void skip_block_comment(Lexer *lexer)
+{
+    size_t comment_line = lexer->line;
+    lexer->total_comments++;
+    lexer->block_comments++;
+    advance_char(lexer); /* / */
+    advance_char(lexer); /* * */
+
+    bool closed = false;
+    while (lexer->position < lexer->source_length) {
+        if (current_char(lexer) == '*' && lookahead_char(lexer, 1) == '/') {
+            advance_char(lexer);
+            advance_char(lexer);
+            closed = true;
+            break;
+        }
+        advance_char(lexer);
+    }
+
+    if (!closed) {
+        lexer->unterminated_comments++;
+        fprintf(stderr,
+                "Warning: unterminated block comment beginning on line %zu.\n",
+                comment_line);
+    }
+}
+
+static bool scan_number(Lexer *lexer)
+{
+    size_t start = lexer->position;
+    size_t start_line = lexer->line;
+    size_t start_column = lexer->column;
+    char previous = '\0';
+
+    /* Consume a preprocessing-number-like sequence, then validate its form. */
+    while (lexer->position < lexer->source_length) {
+        char c = current_char(lexer);
+        if (isalnum((unsigned char)c) || c == '_' || c == '.') {
+            previous = c;
+            advance_char(lexer);
+        } else if ((c == '+' || c == '-') &&
+                   (previous == 'e' || previous == 'E' ||
+                    previous == 'p' || previous == 'P')) {
+            previous = c;
+            advance_char(lexer);
+        } else {
+            break;
+        }
+    }
+
+    size_t end = lexer->position;
+    size_t length = end - start;
+    char *number = malloc(length + 1);
+    if (number == NULL) {
+        lexer->allocation_failed = true;
+        return false;
+    }
+    memcpy(number, lexer->source + start, length);
+    number[length] = '\0';
+
+    TokenType type;
+    if (is_valid_floating_literal(number)) {
+        type = TOK_FLOAT_LITERAL;
+    } else if (is_valid_integer_literal(number)) {
+        type = TOK_INTEGER_LITERAL;
+    } else {
+        type = TOK_INVALID;
+    }
+
+    free(number);
+    return add_token(lexer, start, end, start_line, start_column, type);
+}
+
+static bool scan_operator_or_punctuator(Lexer *lexer)
+{
+    /* Longest spellings appear first so that, for example, >>= wins over >>. */
+    static const char *operators[] = {
+        ">>=", "<<=", "++", "--", "->", "&&", "||", "<=", ">=", "==",
+        "!=", "*=", "/=", "%=", "+=", "-=", "<<", ">>", "&=", "^=",
+        "|=", "...", "##"
+    };
+    static const char *single_operators = "+-*/%=&|^!~<>?";
+    static const char *punctuators = "()[]{};,.:";
+
+    size_t start = lexer->position;
+    size_t start_line = lexer->line;
+    size_t start_column = lexer->column;
+
+    for (size_t i = 0; i < sizeof(operators) / sizeof(operators[0]); i++) {
+        size_t length = strlen(operators[i]);
+        if (lexer->position + length <= lexer->source_length &&
+            strncmp(lexer->source + lexer->position, operators[i], length) == 0) {
+            for (size_t j = 0; j < length; j++) {
+                advance_char(lexer);
+            }
+            TokenType type = strcmp(operators[i], "##") == 0
+                                 ? TOK_PREPROCESSOR
+                                 : (strcmp(operators[i], "...") == 0
+                                        ? TOK_PUNCTUATOR
+                                        : TOK_OPERATOR);
+            return add_token(lexer, start, lexer->position,
+                             start_line, start_column, type);
+        }
+    }
+
+    char c = current_char(lexer);
+    if (c != '\0' && strchr(single_operators, c) != NULL) {
+        advance_char(lexer);
+        return add_token(lexer, start, lexer->position,
+                         start_line, start_column,
+                         c == '#' ? TOK_PREPROCESSOR : TOK_OPERATOR);
+    }
+
+    if (c == '#') {
+        advance_char(lexer);
+        return add_token(lexer, start, lexer->position,
+                         start_line, start_column, TOK_PREPROCESSOR);
+    }
+
+    if (c != '\0' && strchr(punctuators, c) != NULL) {
+        advance_char(lexer);
+        return add_token(lexer, start, lexer->position,
+                         start_line, start_column, TOK_PUNCTUATOR);
+    }
+
+    /* Unknown source character: preserve it as a token instead of dropping it. */
+    advance_char(lexer);
+    return add_token(lexer, start, lexer->position,
+                     start_line, start_column, TOK_INVALID);
+}
+
+static bool scan_all_tokens(Lexer *lexer)
+{
+    while (lexer->position < lexer->source_length) {
+        char c = current_char(lexer);
+
+        if (isspace((unsigned char)c)) {
+            advance_char(lexer);
+            continue;
+        }
+
+        if (c == '/' && lookahead_char(lexer, 1) == '/') {
+            skip_line_comment(lexer);
+            continue;
+        }
+        if (c == '/' && lookahead_char(lexer, 1) == '*') {
+            skip_block_comment(lexer);
+            continue;
+        }
+
+        size_t prefix_length = 0;
+        if (c == '"' || c == '\'') {
+            if (!scan_quoted_literal(lexer, 0)) {
+                return false;
+            }
+            continue;
+        }
+        if (has_string_or_character_prefix(lexer, &prefix_length)) {
+            if (!scan_quoted_literal(lexer, prefix_length)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (isdigit((unsigned char)c) ||
+            (c == '.' && isdigit((unsigned char)lookahead_char(lexer, 1)))) {
+            if (!scan_number(lexer)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (is_identifier_start(c)) {
+            size_t start = lexer->position;
+            size_t start_line = lexer->line;
+            size_t start_column = lexer->column;
+            while (lexer->position < lexer->source_length &&
+                   is_identifier_part(current_char(lexer))) {
+                advance_char(lexer);
+            }
+
+            size_t length = lexer->position - start;
+            char *word = malloc(length + 1);
+            if (word == NULL) {
+                lexer->allocation_failed = true;
+                return false;
+            }
+            memcpy(word, lexer->source + start, length);
+            word[length] = '\0';
+            TokenType type = is_keyword(word) ? TOK_KEYWORD : TOK_IDENTIFIER;
+            free(word);
+
+            if (!add_token(lexer, start, lexer->position,
+                           start_line, start_column, type)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (!scan_operator_or_punctuator(lexer)) {
+            return false;
+        }
+    }
+
+    return !lexer->allocation_failed;
+}
+
+static CharacterSummary summarize_characters(const char *source, size_t length)
+{
+    CharacterSummary summary = {0, 0, 0, 0, 0};
+    summary.total = length;
+
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)source[i];
+        if (isalpha(c)) {
+            summary.letters++;
+        } else if (isdigit(c)) {
+            summary.digits++;
+        } else if (isspace(c)) {
+            summary.whitespace++;
+        } else {
+            summary.other++;
+        }
+    }
+    return summary;
+}
+
+static void make_display_lexeme(const Token *token, char *output, size_t capacity)
+{
+    size_t out = 0;
+    for (size_t i = 0; i < token->length && out + 1 < capacity; i++) {
+        unsigned char c = (unsigned char)token->lexeme[i];
+        const char *replacement = NULL;
+        if (c == '\n') replacement = "\\n";
+        else if (c == '\r') replacement = "\\r";
+        else if (c == '\t') replacement = "\\t";
+        else if (c == '\\') replacement = "\\\\";
+
+        if (replacement != NULL) {
+            size_t n = strlen(replacement);
+            if (out + n >= capacity) break;
+            memcpy(output + out, replacement, n);
+            out += n;
+        } else if (isprint(c)) {
+            output[out++] = (char)c;
+        } else {
+            if (out + 4 >= capacity) break;
+            int written = snprintf(output + out, capacity - out, "\\x%02X", c);
+            if (written < 0) break;
+            out += (size_t)written;
+        }
+    }
+
+    if (out + 4 < capacity && token->length > 0) {
+        /* Indicate truncation when the display buffer filled before the lexeme ended. */
+        size_t represented = 0;
+        for (size_t i = 0; i < token->length && represented < out; i++) {
+            unsigned char c = (unsigned char)token->lexeme[i];
+            represented += (c == '\n' || c == '\r' || c == '\t' || c == '\\') ? 2 :
+                           (isprint(c) ? 1 : 4);
+        }
+        if (represented < token->length) {
+            output[out++] = '.';
+            output[out++] = '.';
+            output[out++] = '.';
+        }
+    }
+    output[out] = '\0';
+}
+
+static void print_token_table(const Lexer *lexer)
+{
+    printf("\n================ TOKEN-BY-TOKEN ANALYSIS ================\n");
+    printf("%-6s | %-38s | %-23s | %-6s | %-6s | %-6s\n",
+           "No.", "Lexeme", "Token type", "Line", "Column", "Chars");
+    printf("-------+----------------------------------------+-------------------------+--------+--------+-------\n");
+
+    for (size_t i = 0; i < lexer->token_count; i++) {
+        char display[160];
+        make_display_lexeme(&lexer->tokens[i], display, sizeof(display));
+        printf("%-6zu | %-38.38s | %-23s | %-6zu | %-6zu | %-6zu\n",
+               i + 1,
+               display,
+               token_type_name(lexer->tokens[i].type),
+               lexer->tokens[i].line,
+               lexer->tokens[i].column,
+               lexer->tokens[i].length);
+    }
+}
+
+static void print_summary(const Lexer *lexer, const CharacterSummary *characters)
+{
+    printf("\n================ TOKEN SUMMARY ================\n");
+    for (int i = 0; i < TOK_TYPE_COUNT; i++) {
+        printf("%-24s : %zu\n", token_type_name((TokenType)i),
+               lexer->category_count[i]);
+    }
+    printf("------------------------------------------------\n");
+    printf("%-24s : %zu\n", "Total tokens", lexer->token_count);
+
+    printf("\n================ SOURCE CHARACTER SUMMARY ================\n");
+    printf("Total source bytes       : %zu\n", characters->total);
+    printf("Letters                  : %zu\n", characters->letters);
+    printf("Digits                   : %zu\n", characters->digits);
+    printf("Whitespace (incl. newline): %zu\n", characters->whitespace);
+    printf("Other characters         : %zu\n", characters->other);
+
+    printf("\n================ COMMENTS (NOT TOKENS) ================\n");
+    printf("Total comments           : %zu\n", lexer->total_comments);
+    printf("Single-line comments     : %zu\n", lexer->line_comments);
+    printf("Block comments           : %zu\n", lexer->block_comments);
+    printf("Unterminated block comments: %zu\n", lexer->unterminated_comments);
+    printf("Lexical errors/unknowns  : %zu\n", lexer->lexical_errors + lexer->unterminated_comments);
+}
+
+static void free_identifier_table(IdentifierTable *table)
+{
+    for (size_t i = 0; i < table->count; i++) {
+        free(table->entries[i].occurrences);
+    }
+    free(table->entries);
+    table->entries = NULL;
+    table->count = 0;
+    table->capacity = 0;
+}
+
+static IdentifierEntry *find_identifier(IdentifierTable *table, const char *name)
+{
+    for (size_t i = 0; i < table->count; i++) {
+        if (strcmp(table->entries[i].name, name) == 0) {
+            return &table->entries[i];
+        }
+    }
+    return NULL;
+}
+
+static bool add_identifier_occurrence(IdentifierTable *table, const Token *token)
+{
+    IdentifierEntry *entry = find_identifier(table, token->lexeme);
+
+    if (entry == NULL) {
+        if (table->count == table->capacity) {
+            size_t new_capacity = table->capacity == 0 ? 16 : table->capacity * 2;
+            if (new_capacity < table->capacity ||
+                new_capacity > SIZE_MAX / sizeof(IdentifierEntry)) {
+                return false;
+            }
+            IdentifierEntry *new_entries = realloc(
+                table->entries, new_capacity * sizeof(IdentifierEntry));
+            if (new_entries == NULL) {
+                return false;
+            }
+            table->entries = new_entries;
+            table->capacity = new_capacity;
+        }
+
+        entry = &table->entries[table->count++];
+        entry->name = token->lexeme;
+        entry->frequency = 0;
+        entry->occurrences = NULL;
+        entry->occurrence_count = 0;
+        entry->occurrence_capacity = 0;
+    }
+
+    if (entry->occurrence_count == entry->occurrence_capacity) {
+        size_t new_capacity = entry->occurrence_capacity == 0
+                                  ? 4
+                                  : entry->occurrence_capacity * 2;
+        if (new_capacity < entry->occurrence_capacity ||
+            new_capacity > SIZE_MAX / sizeof(IdentifierOccurrence)) {
+            return false;
+        }
+        IdentifierOccurrence *new_occurrences = realloc(
+            entry->occurrences, new_capacity * sizeof(IdentifierOccurrence));
+        if (new_occurrences == NULL) {
+            return false;
+        }
+        entry->occurrences = new_occurrences;
+        entry->occurrence_capacity = new_capacity;
+    }
+
+    entry->occurrences[entry->occurrence_count].line = token->line;
+    entry->occurrences[entry->occurrence_count].column = token->column;
+    entry->occurrence_count++;
+    entry->frequency++;
+    return true;
+}
+
+static bool build_identifier_table(const Lexer *lexer, IdentifierTable *table)
+{
+    for (size_t i = 0; i < lexer->token_count; i++) {
+        if (lexer->tokens[i].type == TOK_IDENTIFIER &&
+            !add_identifier_occurrence(table, &lexer->tokens[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void print_identifier_table(const IdentifierTable *table)
+{
+    size_t total_occurrences = 0;
+
+    printf("\n================ IDENTIFIER FREQUENCY TABLE ================\n");
+    printf("%-6s | %-28s | %-10s | %s\n",
+           "No.", "Identifier", "Frequency", "Occurrences (line:column)");
+    printf("-------+------------------------------+------------+------------------------------------------\n");
+
+    for (size_t i = 0; i < table->count; i++) {
+        const IdentifierEntry *entry = &table->entries[i];
+        printf("%-6zu | %-28.28s | %-10zu | ",
+               i + 1, entry->name, entry->frequency);
+        for (size_t j = 0; j < entry->occurrence_count; j++) {
+            printf("%s%zu:%zu", j == 0 ? "" : ", ",
+                   entry->occurrences[j].line,
+                   entry->occurrences[j].column);
+        }
+        putchar('\n');
+        total_occurrences += entry->frequency;
+    }
+
+    if (table->count == 0) {
+        printf("No identifiers found.\n");
+    }
+    printf("--------------------------------------------------------------\n");
+    printf("Unique identifiers           : %zu\n", table->count);
+    printf("Total identifier occurrences : %zu\n", total_occurrences);
+}
+
+static bool verify_identifier_table(const Lexer *lexer,
+                                    const IdentifierTable *table)
+{
+    size_t frequency_sum = 0;
+    bool entries_valid = true;
+
+    for (size_t i = 0; i < table->count; i++) {
+        const IdentifierEntry *entry = &table->entries[i];
+        if (entry->name == NULL || entry->frequency == 0 ||
+            entry->frequency != entry->occurrence_count) {
+            entries_valid = false;
+        }
+        frequency_sum += entry->frequency;
+    }
+
+    /* Independently confirm that every identifier token has a matching
+       name and source location in the frequency table. */
+    size_t matched_tokens = 0;
+    for (size_t i = 0; i < lexer->token_count; i++) {
+        const Token *token = &lexer->tokens[i];
+        if (token->type != TOK_IDENTIFIER) {
+            continue;
+        }
+
+        bool found = false;
+        for (size_t j = 0; j < table->count && !found; j++) {
+            const IdentifierEntry *entry = &table->entries[j];
+            if (strcmp(entry->name, token->lexeme) != 0) {
+                continue;
+            }
+            for (size_t k = 0; k < entry->occurrence_count; k++) {
+                if (entry->occurrences[k].line == token->line &&
+                    entry->occurrences[k].column == token->column) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) {
+            matched_tokens++;
+        } else {
+            entries_valid = false;
+        }
+    }
+
+    bool passed = entries_valid &&
+                  frequency_sum == lexer->category_count[TOK_IDENTIFIER] &&
+                  matched_tokens == lexer->category_count[TOK_IDENTIFIER];
+
+    printf("\n================ IDENTIFIER TABLE VERIFICATION ================\n");
+    printf("Identifier tokens in lexer    : %zu\n",
+           lexer->category_count[TOK_IDENTIFIER]);
+    printf("Occurrences in frequency table: %zu\n", frequency_sum);
+    printf("Identifier tokens matched     : %zu\n", matched_tokens);
+    printf("Every identifier is recorded  : %s\n", entries_valid ? "YES" : "NO");
+    printf("RESULT: %s\n", passed
+               ? "PASS - every identifier occurrence is represented exactly in the table."
+               : "FAIL - the identifier frequency table is incomplete or inconsistent.");
+    return passed;
+}
+
+static bool verify_counts(const Lexer *lexer)
+{
+    size_t recalculated[TOK_TYPE_COUNT] = {0};
+    size_t counted_tokens = 0;
+    bool token_records_valid = true;
+    size_t previous_end = 0;
+
+    for (size_t i = 0; i < lexer->token_count; i++) {
+        const Token *token = &lexer->tokens[i];
+
+        if (token->lexeme == NULL || token->length == 0 ||
+            token->type < 0 || token->type >= TOK_TYPE_COUNT ||
+            token->end_offset <= token->start_offset ||
+            token->end_offset - token->start_offset != token->length ||
+            (i > 0 && token->start_offset < previous_end) ||
+            !token->counted) {
+            token_records_valid = false;
+            continue;
+        }
+
+        previous_end = token->end_offset;
+        recalculated[token->type]++;
+        counted_tokens++;
+    }
+
+    size_t category_sum = 0;
+    bool categories_match = true;
+    for (int i = 0; i < TOK_TYPE_COUNT; i++) {
+        category_sum += lexer->category_count[i];
+        if (recalculated[i] != lexer->category_count[i]) {
+            categories_match = false;
+        }
+    }
+
+    bool passed = token_records_valid && categories_match &&
+                  counted_tokens == lexer->token_count &&
+                  category_sum == lexer->token_count;
+
+    printf("\n================ TOKEN COUNT VERIFICATION ================\n");
+    printf("Tokens stored in token table : %zu\n", lexer->token_count);
+    printf("Tokens marked as counted     : %zu\n", counted_tokens);
+    printf("Sum of all category counts   : %zu\n", category_sum);
+    printf("Each token has a valid record: %s\n", token_records_valid ? "YES" : "NO");
+    printf("Category totals match table  : %s\n", categories_match ? "YES" : "NO");
+
+    if (passed) {
+        printf("RESULT: PASS - every stored token is classified and counted exactly once.\n");
+    } else {
+        printf("RESULT: FAIL - a token or category count is missing or inconsistent.\n");
+    }
+
+    return passed;
+}
+
+static bool has_c_extension(const char *path)
+{
+    size_t length = strlen(path);
+    return length >= 2 && path[length - 2] == '.' &&
+           tolower((unsigned char)path[length - 1]) == 'c';
+}
+
+static void free_lexer(Lexer *lexer)
+{
+    for (size_t i = 0; i < lexer->token_count; i++) {
+        free(lexer->tokens[i].lexeme);
+    }
+    free(lexer->tokens);
+}
+
+int main(int argc, char *argv[])
+{
+    char path[1024];
+    const char *file_path = NULL;
+
+    if (argc > 2) {
+        fprintf(stderr, "Usage: %s [source_file.c]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (argc == 2) {
+        file_path = argv[1];
+    } else {
+        printf("Enter path of the C source file (.c): ");
+        if (fgets(path, sizeof(path), stdin) == NULL) {
+            fprintf(stderr, "Error: unable to read file path.\n");
+            return EXIT_FAILURE;
+        }
+        path[strcspn(path, "\r\n")] = '\0';
+        if (path[0] == '\0') {
+            fprintf(stderr, "Error: no file path entered.\n");
+            return EXIT_FAILURE;
+        }
+        file_path = path;
+    }
+
+    if (!has_c_extension(file_path)) {
+        fprintf(stderr, "Error: please provide a file with a .c extension.\n");
+        return EXIT_FAILURE;
+    }
+
+    FILE *file = fopen(file_path, "rb");
+    if (file == NULL) {
+        perror("Error opening source file");
+        fprintf(stderr, "Tip: check the path and make sure the file exists.\n");
+        return EXIT_FAILURE;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        perror("Error reading source file");
+        fclose(file);
+        return EXIT_FAILURE;
+    }
+    long file_size = ftell(file);
+    if (file_size < 0 || (uintmax_t)file_size > (uintmax_t)(SIZE_MAX - 1)) {
+        fprintf(stderr, "Error: unable to determine source file size.\n");
+        fclose(file);
+        return EXIT_FAILURE;
+    }
+    rewind(file);
+
+    size_t source_length = (size_t)file_size;
+    char *source = malloc(source_length + 1);
+    if (source == NULL) {
+        fprintf(stderr, "Error: insufficient memory to read source file.\n");
+        fclose(file);
+        return EXIT_FAILURE;
+    }
+
+    size_t bytes_read = fread(source, 1, source_length, file);
+    if (bytes_read != source_length && ferror(file)) {
+        perror("Error reading source file");
+        free(source);
+        fclose(file);
+        return EXIT_FAILURE;
+    }
+    fclose(file);
+    source[bytes_read] = '\0';
+    source_length = bytes_read;
+
+    Lexer lexer = {0};
+    lexer.source = source;
+    lexer.source_length = source_length;
+    lexer.line = 1;
+    lexer.column = 1;
+
+    CharacterSummary characters = summarize_characters(source, source_length);
+
+    printf("\nC LEXICAL ANALYSER\n");
+    printf("Source file: %s\n", file_path);
+    printf("------------------------------------------------------------\n");
+
+    if (!scan_all_tokens(&lexer)) {
+        fprintf(stderr, "Error: lexical analysis stopped because memory allocation failed.\n");
+        free_lexer(&lexer);
+        free(source);
+        return EXIT_FAILURE;
+    }
+
+    IdentifierTable identifier_table = {0};
+    if (!build_identifier_table(&lexer, &identifier_table)) {
+        fprintf(stderr, "Error: insufficient memory while building identifier frequency table.\n");
+        free_identifier_table(&identifier_table);
+        free_lexer(&lexer);
+        free(source);
+        return EXIT_FAILURE;
+    }
+
+    print_token_table(&lexer);
+    print_identifier_table(&identifier_table);
+    print_summary(&lexer, &characters);
+    bool token_verification_passed = verify_counts(&lexer);
+    bool identifier_verification_passed = verify_identifier_table(&lexer, &identifier_table);
+
+    free_identifier_table(&identifier_table);
+    free_lexer(&lexer);
+    free(source);
+
+    return (token_verification_passed && identifier_verification_passed)
+               ? EXIT_SUCCESS
+               : EXIT_FAILURE;
+}
